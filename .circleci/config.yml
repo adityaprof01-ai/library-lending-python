@@ -24,7 +24,7 @@ jobs:
       - run:
           name: Run unit tests with coverage
           command: |
-            pytest tests/test_fines.py \
+            pytest tests/test_fines.py tests/test_unit_app.py \
               --cov=app \
               --cov-report=term-missing \
               --cov-fail-under=70
@@ -43,7 +43,7 @@ jobs:
       - run:
           name: Install client utilities and dependencies
           command: |
-            sudo apt-get update && sudo apt-get install -y postgresql-client
+            sudo apt-get update && sudo apt-get install -y postgresql-client netcat-openbsd
             pip install -r requirements-dev.txt
       - run:
           name: Wait for Postgres & Redis
