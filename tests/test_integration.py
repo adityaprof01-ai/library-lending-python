@@ -151,3 +151,50 @@ class TestIntegrationEndpoints:
         # Paying again when cleared gives 409
         resp2 = client.post("/members/4/fines/pay")
         assert resp2.status_code == 409
+
+    def test_index_ui_endpoint(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "Library Lending System" in resp.text
+
+    def test_books_crud_lifecycle(self, client):
+        # 1. Create a new book with 2 copies
+        create_resp = client.post("/books", json={
+            "title": "Continuous Delivery",
+            "author": "Jez Humble & David Farley",
+            "copies_count": 2,
+            "reference_only": False,
+        })
+        assert create_resp.status_code == 201
+        book_data = create_resp.json()
+        book_id = book_data["id"]
+        assert book_data["copies_created"] == 2
+
+        # 2. Retrieve book details
+        get_resp = client.get(f"/books/{book_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["total_copies"] == 2
+        assert get_resp.json()["available_copies"] == 2
+
+        # 3. Borrow one copy
+        borrow_resp = client.post("/borrow", json={"member_id": 1, "book_id": book_id})
+        assert borrow_resp.status_code == 201
+        loan_id = borrow_resp.json()["loan_id"]
+
+        # 4. Deleting book while a copy is on loan must fail with 409
+        del_fail_resp = client.delete(f"/books/{book_id}")
+        assert del_fail_resp.status_code == 409
+        assert del_fail_resp.json()["detail"] == "book_has_active_loans"
+
+        # 5. Return the borrowed copy
+        ret_resp = client.post("/return", json={"loan_id": loan_id})
+        assert ret_resp.status_code == 200
+
+        # 6. Deleting book after return must succeed
+        del_ok_resp = client.delete(f"/books/{book_id}")
+        assert del_ok_resp.status_code == 200
+        assert del_ok_resp.json()["status"] == "deleted"
+
+        # 7. Subsequent GET must return 404
+        assert client.get(f"/books/{book_id}").status_code == 404
+
