@@ -1,6 +1,16 @@
 version: 2.1
 
 jobs:
+  secret-scan:
+    docker:
+      - image: zricethezav/gitleaks:latest
+        entrypoint: ["/bin/sh"]
+    steps:
+      - checkout
+      - run:
+          name: 1. Run Gitleaks Secret Scan
+          command: gitleaks detect --source=. --verbose --report-path=gitleaks.json --redact
+
   lint:
     docker:
       - image: cimg/python:3.12
@@ -10,7 +20,7 @@ jobs:
           name: Install linter
           command: pip install ruff==0.4.8
       - run:
-          name: Run Ruff linter
+          name: 2. Run Ruff Linter
           command: ruff check .
 
   unit-tests:
@@ -22,7 +32,7 @@ jobs:
           name: Install dependencies
           command: pip install -r requirements-dev.txt
       - run:
-          name: Run unit tests with coverage
+          name: 3. Run Unit Tests with Coverage
           command: |
             pytest tests/test_fines.py tests/test_unit_app.py \
               --cov=app \
@@ -64,23 +74,13 @@ jobs:
               PGPASSWORD=postgres psql -h localhost -U postgres -d library -f "$file"
             done
       - run:
-          name: Run integration tests
+          name: 4. Run Integration Tests
           environment:
             DATABASE_URL: postgresql://postgres:postgres@localhost:5432/library
             REDIS_URL: redis://localhost:6379/0
           command: pytest tests/test_integration.py -v
 
-  secret-scan:
-    docker:
-      - image: zricethezav/gitleaks:latest
-        entrypoint: ["/bin/sh"]
-    steps:
-      - checkout
-      - run:
-          name: Run Gitleaks Secret Scan
-          command: gitleaks detect --source=. --verbose --report-path=gitleaks.json --redact
-
-  image-build:
+  image-build-and-push:
     docker:
       - image: cimg/base:current
     steps:
@@ -88,34 +88,120 @@ jobs:
       - setup_remote_docker:
           docker_layer_caching: true
       - run:
-          name: Build Docker image
+          name: 5 & 6. Build and Push Docker Image with Dual Tags
           command: |
-            IMAGE_TAG="${DOCKERHUB_USERNAME:-library}/library-lending:1.0"
-            docker build -t "$IMAGE_TAG" .
-      - run:
-          name: Push to Docker Hub
-          command: |
-            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_PASSWORD" ]; then
-              echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-              docker push "${DOCKERHUB_USERNAME}/library-lending:1.0"
+            set -e
+
+            DOCKER_USER="${DOCKERHUB_USER:-$DOCKERHUB_USERNAME}"
+            DOCKER_TOKEN="${DOCKERHUB_TOKEN:-$DOCKERHUB_PASSWORD}"
+            DOCKER_REPO="${DOCKERHUB_REPO:-library-lending-python}"
+
+            SHORT_SHA=$(echo "${CIRCLE_SHA1}" | cut -c1-7)
+
+            case "${CIRCLE_BRANCH}" in
+              main)
+                MOVING_TAG="qa"
+                ;;
+              staging)
+                MOVING_TAG="stage"
+                ;;
+              prod)
+                MOVING_TAG="prod"
+                ;;
+              *)
+                MOVING_TAG="${CIRCLE_BRANCH}"
+                ;;
+            esac
+
+            IMMUTABLE_TAG="${CIRCLE_BRANCH}-${SHORT_SHA}"
+
+            TARGET_REPO="${DOCKER_USER:-library}/${DOCKER_REPO}"
+
+            echo "=== Docker Build Configuration ==="
+            echo "Branch: ${CIRCLE_BRANCH}"
+            echo "Repository: ${TARGET_REPO}"
+            echo "Moving Tag: ${TARGET_REPO}:${MOVING_TAG}"
+            echo "Immutable Tag: ${TARGET_REPO}:${IMMUTABLE_TAG}"
+
+            docker build \
+              -t "${TARGET_REPO}:${MOVING_TAG}" \
+              -t "${TARGET_REPO}:${IMMUTABLE_TAG}" \
+              .
+
+            if [ -n "$DOCKER_USER" ] && [ -n "$DOCKER_TOKEN" ]; then
+              echo "Authenticating to Docker Hub as ${DOCKER_USER}..."
+              echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USER" --password-stdin
+
+              echo "Pushing moving tag: ${TARGET_REPO}:${MOVING_TAG}..."
+              docker push "${TARGET_REPO}:${MOVING_TAG}"
+
+              echo "Pushing immutable tag: ${TARGET_REPO}:${IMMUTABLE_TAG}..."
+              docker push "${TARGET_REPO}:${IMMUTABLE_TAG}"
+
+              echo "Successfully pushed both tags to Docker Hub."
             else
-              echo "Docker Hub credentials not configured. Image built successfully without push."
+              echo "NOTE: DOCKERHUB_USER and DOCKERHUB_TOKEN are not set in CircleCI project environment variables."
+              echo "Image built successfully, skipping push."
             fi
 
 workflows:
   version: 2
-  pipeline:
+
+  # QA pipeline on main (and PR / feature verification without push)
+  qa-pipeline:
     jobs:
-      - lint
+      - secret-scan:
+          filters:
+            branches:
+              ignore:
+                - staging
+                - prod
+      - lint:
+          requires:
+            - secret-scan
+          filters:
+            branches:
+              ignore:
+                - staging
+                - prod
       - unit-tests:
           requires:
             - lint
+          filters:
+            branches:
+              ignore:
+                - staging
+                - prod
       - integration-tests:
           requires:
             - unit-tests
-      - secret-scan:
+          filters:
+            branches:
+              ignore:
+                - staging
+                - prod
+      - image-build-and-push:
           requires:
             - integration-tests
-      - image-build:
-          requires:
-            - secret-scan
+          filters:
+            branches:
+              only:
+                - main
+
+  # Build-only on staging (No test stages)
+  staging-pipeline:
+    jobs:
+      - image-build-and-push:
+          filters:
+            branches:
+              only:
+                - staging
+
+  # Build-only on prod (No test stages)
+  prod-pipeline:
+    jobs:
+      - image-build-and-push:
+          filters:
+            branches:
+              only:
+                - prod

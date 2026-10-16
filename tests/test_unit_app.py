@@ -380,3 +380,91 @@ class TestDbAndCacheHelpers:
             mock_redis.scan_iter.return_value = ["pre:1", "pre:2"]
             cache.drop_prefix("pre:")
             assert mock_redis.delete.call_count >= 2
+
+
+class TestBooksManagementAndUi:
+    def test_index_ui(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "Library Lending System" in resp.text
+
+    def test_create_book_success(self, client):
+        with patch.object(db, "connect") as mock_conn, \
+             patch.object(cache, "drop") as mock_drop:
+            mock_cur = MagicMock()
+            mock_cur.fetchone.return_value = {"id": 42}
+            mock_conn.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value = mock_cur
+
+            resp = client.post("/books", json={
+                "title": "Site Reliability Engineering",
+                "author": "Niall Richard Murphy",
+                "copies_count": 3,
+                "reference_only": False,
+            })
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["id"] == 42
+            assert data["title"] == "Site Reliability Engineering"
+            assert data["copies_created"] == 3
+            mock_drop.assert_called_with("avail:42")
+
+    def test_create_book_validation_errors(self, client):
+        # Missing title
+        resp1 = client.post("/books", json={"title": "", "author": "Someone"})
+        assert resp1.status_code == 400
+
+        # Invalid copies count
+        resp2 = client.post("/books", json={"title": "Test", "author": "Author", "copies_count": -5})
+        assert resp2.status_code == 400
+
+        resp3 = client.post("/books", json={"title": "Test", "author": "Author", "copies_count": "invalid"})
+        assert resp3.status_code == 400
+
+    def test_get_book_success(self, client):
+        with patch.object(db, "one", return_value={"id": 1, "title": "DDIA", "author": "Kleppmann", "reference_only": False}), \
+             patch.object(db, "query", return_value=[{"id": 101, "barcode": "LIB-0001-01", "status": "available"}]), \
+             patch("app.main._available", return_value=(1, False)):
+            resp = client.get("/books/1")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["book"]["id"] == 1
+            assert data["total_copies"] == 1
+            assert data["available_copies"] == 1
+
+    def test_get_book_not_found(self, client):
+        with patch.object(db, "one", return_value=None):
+            resp = client.get("/books/999")
+            assert resp.status_code == 404
+
+    def test_delete_book_success(self, client):
+        with patch.object(db, "one", side_effect=[
+            {"id": 5, "title": "Removable Book"},  # Book check
+            {"n": 0},  # Active loans check
+        ]), \
+             patch.object(db, "connect") as mock_conn, \
+             patch.object(cache, "drop") as mock_drop:
+            mock_cur = MagicMock()
+            mock_conn.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value = mock_cur
+
+            resp = client.delete("/books/5")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "deleted"
+            assert data["book_id"] == 5
+            mock_drop.assert_called_with("avail:5")
+
+    def test_delete_book_with_active_loans(self, client):
+        with patch.object(db, "one", side_effect=[
+            {"id": 5, "title": "Active Book"},
+            {"n": 2},  # Has active loans
+        ]):
+            resp = client.delete("/books/5")
+            assert resp.status_code == 409
+            assert resp.json()["detail"] == "book_has_active_loans"
+
+    def test_delete_book_not_found(self, client):
+        with patch.object(db, "one", return_value=None):
+            resp = client.delete("/books/999")
+            assert resp.status_code == 404
+
