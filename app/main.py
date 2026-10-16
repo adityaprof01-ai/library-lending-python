@@ -2,16 +2,22 @@ from datetime import date
 from uuid import uuid4
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import cache, db
 from .fines import (LOAN_DAYS, can_borrow, can_renew, due_date, fine_for,
                     member_summary, projected_fine, renewed_due_date)
+from .ui import UI_HTML
 
 app = FastAPI(title="library-lending")
 
 AVAIL_TTL = 30          # seconds; short, because availability changes fast
 LOCK_MS = 4000          # how long a borrow may hold the per-book lock
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(content=UI_HTML)
 
 
 @app.get("/health")
@@ -71,6 +77,89 @@ def books():
         " count(c.id) FILTER (WHERE c.status='available') AS available"
         " FROM books b LEFT JOIN copies c ON c.book_id=b.id"
         " GROUP BY b.id ORDER BY b.id")}
+
+
+@app.post("/books", status_code=201)
+def create_book(payload: dict = Body(...)):
+    title = payload.get("title")
+    author = payload.get("author")
+    copies_count = payload.get("copies_count", 1)
+    reference_only = bool(payload.get("reference_only", False))
+
+    if not title or not author:
+        raise HTTPException(400, "title and author are required")
+    try:
+        copies_count = int(copies_count)
+        if copies_count < 1 or copies_count > 50:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(400, "copies_count must be an integer between 1 and 50")
+
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO books (title, author, reference_only) VALUES (%s, %s, %s) RETURNING id",
+            (str(title).strip(), str(author).strip(), reference_only),
+        )
+        book_id = cur.fetchone()["id"]
+        for i in range(copies_count):
+            barcode = f"LIB-{book_id:04d}-{i+1:02d}"
+            cur.execute(
+                "INSERT INTO copies (book_id, barcode, status) VALUES (%s, %s, 'available')",
+                (book_id, barcode),
+            )
+
+    cache.drop(f"avail:{book_id}")
+    return {
+        "id": book_id,
+        "title": str(title).strip(),
+        "author": str(author).strip(),
+        "reference_only": reference_only,
+        "copies_created": copies_count,
+    }
+
+
+@app.get("/books/{book_id}")
+def get_book(book_id: int):
+    book = db.one("SELECT id, title, author, reference_only FROM books WHERE id=%s", (book_id,))
+    if not book:
+        raise HTTPException(404, "no such book")
+    copies = db.query(
+        "SELECT id, barcode, status FROM copies WHERE book_id=%s ORDER BY id", (book_id,)
+    )
+    n, cached = _available(book_id)
+    return {
+        "book": book,
+        "copies": copies,
+        "available_copies": n,
+        "total_copies": len(copies),
+        "cached": cached,
+    }
+
+
+@app.delete("/books/{book_id}")
+def delete_book(book_id: int):
+    book = db.one("SELECT id, title FROM books WHERE id=%s", (book_id,))
+    if not book:
+        raise HTTPException(404, "no such book")
+
+    active_loans = db.one(
+        "SELECT count(*) AS n FROM loans l JOIN copies c ON c.id=l.copy_id "
+        "WHERE c.book_id=%s AND l.returned_on IS NULL",
+        (book_id,),
+    )
+    if active_loans and int(active_loans["n"]) > 0:
+        raise HTTPException(409, "book_has_active_loans")
+
+    with db.connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM loans WHERE copy_id IN (SELECT id FROM copies WHERE book_id=%s)",
+            (book_id,),
+        )
+        cur.execute("DELETE FROM copies WHERE book_id=%s", (book_id,))
+        cur.execute("DELETE FROM books WHERE id=%s", (book_id,))
+
+    cache.drop(f"avail:{book_id}")
+    return {"status": "deleted", "book_id": book_id, "title": book["title"]}
 
 
 @app.get("/books/{book_id}/availability")
