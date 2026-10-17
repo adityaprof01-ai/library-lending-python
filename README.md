@@ -152,5 +152,4 @@ Contention for the last copy of a book is an expected business reality in a conc
 | Build takes minutes each time | `COPY . .` is above your dependency install. |
 | CI cannot reach the database | In CircleCI service containers the host **is** `localhost` — opposite of compose. |
 
-
-HEllo shubham
+HELLO ADITYA SHUBHAM
